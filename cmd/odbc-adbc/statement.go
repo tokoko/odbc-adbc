@@ -29,6 +29,9 @@ type ResultSet struct {
 	rowIndex     int64
 	batchRows    int64
 	done         bool
+	// Raw data mode (for catalog functions — avoids Arrow memory GC issues across CGO calls)
+	rawRows     [][]any
+	rawRowCount int64
 }
 
 func (s *Statement) ensureStatement(conn *Connection) error {
@@ -124,7 +127,17 @@ func (s *Statement) fetch() bool {
 
 	rs := s.result
 
-	// Advance within current batch
+	// Raw data mode (catalog functions)
+	if rs.rawRows != nil {
+		rs.rowIndex++
+		if rs.rowIndex >= rs.rawRowCount {
+			rs.done = true
+			return false
+		}
+		return true
+	}
+
+	// Arrow mode: advance within current batch
 	if rs.currentBatch != nil {
 		rs.rowIndex++
 		if rs.rowIndex < rs.batchRows {
@@ -154,12 +167,48 @@ func (s *Statement) fetch() bool {
 // TODO: support chunked reads — track per-column offset so repeated SQLGetData calls
 // return successive chunks of the same value (needed for large strings/BLOBs).
 func (s *Statement) getData(colNum int, targetType int16, buf unsafe.Pointer, bufLen int) (dataLen int, isNull bool, truncated bool, err error) {
-	if s.result == nil || s.result.currentBatch == nil {
+	if s.result == nil {
 		err = fmt.Errorf("no current row")
 		return
 	}
 
 	rs := s.result
+
+	// Raw data mode (catalog functions)
+	if rs.rawRows != nil {
+		row := int(rs.rowIndex)
+		if row < 0 || row >= len(rs.rawRows) {
+			err = fmt.Errorf("no current row")
+			return
+		}
+		rowData := rs.rawRows[row]
+		if colNum < 1 || colNum > len(rowData) {
+			err = fmt.Errorf("column %d out of range", colNum)
+			return
+		}
+		val := rowData[colNum-1]
+		if val == nil {
+			isNull = true
+			return
+		}
+		dataLen, err = writeRawValue(val, targetType, buf, bufLen)
+		if err == nil && buf != nil && bufLen > 0 {
+			switch targetType {
+			case SQL_C_CHAR, SQL_C_DEFAULT:
+				truncated = dataLen > bufLen-1
+			case SQL_C_WCHAR:
+				truncated = dataLen > bufLen-2
+			}
+		}
+		return
+	}
+
+	// Arrow mode
+	if rs.currentBatch == nil {
+		err = fmt.Errorf("no current row")
+		return
+	}
+
 	if colNum < 1 || colNum > int(rs.currentBatch.NumCols()) {
 		err = fmt.Errorf("column %d out of range", colNum)
 		return
@@ -441,6 +490,103 @@ func getTimeValue(col arrow.Array, row int) time.Time {
 		return toTime(c.Value(row))
 	default:
 		return time.Time{}
+	}
+}
+
+// writeStringToBuffer writes a Go string to a C buffer in the requested ODBC C type format.
+func writeStringToBuffer(str string, targetType int16, buf unsafe.Pointer, bufLen int) (int, error) {
+	switch targetType {
+	case SQL_C_WCHAR:
+		return writeWCharFromString(str, buf, bufLen), nil
+	default:
+		return writeCharFromString(str, buf, bufLen), nil
+	}
+}
+
+func writeCharFromString(str string, buf unsafe.Pointer, bufLen int) int {
+	if buf == nil || bufLen <= 0 {
+		return len(str)
+	}
+	dst := unsafe.Slice((*byte)(buf), bufLen)
+	n := copy(dst, str)
+	if n < bufLen {
+		dst[n] = 0
+	}
+	return len(str)
+}
+
+func writeWCharFromString(str string, buf unsafe.Pointer, bufLen int) int {
+	runes := utf16.Encode([]rune(str))
+	dataLen := len(runes) * 2
+	if buf == nil || bufLen <= 0 {
+		return dataLen
+	}
+	dst := unsafe.Slice((*byte)(buf), bufLen)
+	written := 0
+	for _, r := range runes {
+		if written+2 > bufLen-2 { // reserve 2 bytes for null terminator
+			break
+		}
+		dst[written] = byte(r)
+		dst[written+1] = byte(r >> 8)
+		written += 2
+	}
+	if written+2 <= bufLen {
+		dst[written] = 0
+		dst[written+1] = 0
+	}
+	return dataLen
+}
+
+// writeRawValue writes a Go value (from raw rows) to a C buffer.
+func writeRawValue(val any, targetType int16, buf unsafe.Pointer, bufLen int) (int, error) {
+	switch v := val.(type) {
+	case string:
+		return writeStringToBuffer(v, targetType, buf, bufLen)
+	case int16:
+		return writeInt16ToBuffer(v, targetType, buf, bufLen)
+	case int32:
+		return writeInt32ToBuffer(v, targetType, buf, bufLen)
+	default:
+		return writeStringToBuffer(fmt.Sprint(val), targetType, buf, bufLen)
+	}
+}
+
+func writeInt16ToBuffer(val int16, targetType int16, buf unsafe.Pointer, bufLen int) (int, error) {
+	switch targetType {
+	case SQL_C_SHORT, SQL_C_SSHORT, SQL_C_USHORT:
+		if bufLen < 2 {
+			return 2, nil
+		}
+		*(*int16)(buf) = val
+		return 2, nil
+	case SQL_C_LONG, SQL_C_SLONG, SQL_C_ULONG:
+		if bufLen < 4 {
+			return 4, nil
+		}
+		*(*int32)(buf) = int32(val)
+		return 4, nil
+	default:
+		return writeStringToBuffer(fmt.Sprintf("%d", val), targetType, buf, bufLen)
+	}
+}
+
+func writeInt32ToBuffer(val int32, targetType int16, buf unsafe.Pointer, bufLen int) (int, error) {
+	switch targetType {
+	case SQL_C_LONG, SQL_C_SLONG, SQL_C_ULONG:
+		if bufLen < 4 {
+			return 4, nil
+		}
+		*(*int32)(buf) = val
+		return 4, nil
+	case SQL_C_SHORT, SQL_C_SSHORT, SQL_C_USHORT:
+		if bufLen < 2 {
+			return 2, nil
+		}
+		*(*int16)(buf) = int16(val)
+		return 2, nil
+	default:
+		return writeStringToBuffer(fmt.Sprintf("%d", val), targetType, buf, bufLen)
 	}
 }
 

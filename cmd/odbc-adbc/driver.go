@@ -807,4 +807,102 @@ func SQLGetConnectAttr(connHandle C.SQLHDBC, attribute C.SQLINTEGER, value C.SQL
 	}
 }
 
+//export SQLTables
+func SQLTables(
+	stmtHandle C.SQLHSTMT,
+	catalogName *C.SQLCHAR,
+	catalogNameLen C.SQLSMALLINT,
+	schemaName *C.SQLCHAR,
+	schemaNameLen C.SQLSMALLINT,
+	tableName *C.SQLCHAR,
+	tableNameLen C.SQLSMALLINT,
+	tableType *C.SQLCHAR,
+	tableTypeLen C.SQLSMALLINT,
+) C.SQLRETURN {
+	stmt := registry.getStmt(uintptr(stmtHandle))
+	if stmt == nil {
+		return C.SQL_INVALID_HANDLE
+	}
+
+	conn := registry.getConn(stmt.connID)
+	if conn == nil {
+		return C.SQL_INVALID_HANDLE
+	}
+
+	stmt.diags.clear()
+
+	var catalog, schema, table, tableTypeStr *string
+	if catalogName != nil {
+		s := sqlCharToString(catalogName, C.SQLINTEGER(catalogNameLen))
+		catalog = &s
+	}
+	if schemaName != nil {
+		s := sqlCharToString(schemaName, C.SQLINTEGER(schemaNameLen))
+		schema = &s
+	}
+	if tableName != nil {
+		s := sqlCharToString(tableName, C.SQLINTEGER(tableNameLen))
+		table = &s
+	}
+	if tableType != nil {
+		s := sqlCharToString(tableType, C.SQLINTEGER(tableTypeLen))
+		tableTypeStr = &s
+	}
+
+	if err := stmt.tables(conn, catalog, schema, table, tableTypeStr); err != nil {
+		stmt.diags.addErrorf("SQLTables: %v", err)
+		return C.SQL_ERROR
+	}
+	return C.SQL_SUCCESS
+}
+
+//export SQLColumns
+func SQLColumns(
+	stmtHandle C.SQLHSTMT,
+	catalogName *C.SQLCHAR,
+	catalogNameLen C.SQLSMALLINT,
+	schemaName *C.SQLCHAR,
+	schemaNameLen C.SQLSMALLINT,
+	tableName *C.SQLCHAR,
+	tableNameLen C.SQLSMALLINT,
+	columnName *C.SQLCHAR,
+	columnNameLen C.SQLSMALLINT,
+) C.SQLRETURN {
+	stmt := registry.getStmt(uintptr(stmtHandle))
+	if stmt == nil {
+		return C.SQL_INVALID_HANDLE
+	}
+
+	conn := registry.getConn(stmt.connID)
+	if conn == nil {
+		return C.SQL_INVALID_HANDLE
+	}
+
+	stmt.diags.clear()
+
+	var catalog, schema, table, column *string
+	if catalogName != nil {
+		s := sqlCharToString(catalogName, C.SQLINTEGER(catalogNameLen))
+		catalog = &s
+	}
+	if schemaName != nil {
+		s := sqlCharToString(schemaName, C.SQLINTEGER(schemaNameLen))
+		schema = &s
+	}
+	if tableName != nil {
+		s := sqlCharToString(tableName, C.SQLINTEGER(tableNameLen))
+		table = &s
+	}
+	if columnName != nil {
+		s := sqlCharToString(columnName, C.SQLINTEGER(columnNameLen))
+		column = &s
+	}
+
+	if err := stmt.columns(conn, catalog, schema, table, column); err != nil {
+		stmt.diags.addErrorf("SQLColumns: %v", err)
+		return C.SQL_ERROR
+	}
+	return C.SQL_SUCCESS
+}
+
 func main() {}
