@@ -1,0 +1,19 @@
+[workspace]
+authors = ["tokoko <togurgenidze@gmail.com>"]
+channels = ["conda-forge"]
+name = "odbc-adbc"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+build = "CGO_ENABLED=1 go build -buildmode=c-shared -o odbc-adbc.so ./cmd/odbc-adbc"
+clean = "rm -f odbc-adbc.so odbc-adbc.h"
+test = { cmd = "pytest tests/ -v", depends-on = ["build"] }
+
+[dependencies]
+unixodbc = ">=2.3.14,<3"
+c-compiler = ">=1.11.0,<2"
+cxx-compiler = ">=1.11.0,<2"
+python = ">=3.14.3,<3.15"
+pyodbc = ">=5.3.0,<6"
+pytest = ">=9.0.2,<10"
