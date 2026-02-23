@@ -173,3 +173,38 @@ func arrowTypeNullable(f arrow.Field) int16 {
 	}
 	return SQL_NO_NULLS
 }
+
+// sqlTypeToArrowType maps ODBC SQL types to Arrow data types.
+func sqlTypeToArrowType(sqlType int16) arrow.DataType {
+	switch sqlType {
+	case SQL_BIT:
+		return arrow.FixedWidthTypes.Boolean
+	case SQL_TINYINT:
+		return arrow.PrimitiveTypes.Int8
+	case SQL_SMALLINT:
+		return arrow.PrimitiveTypes.Int16
+	case SQL_INTEGER:
+		return arrow.PrimitiveTypes.Int32
+	case SQL_BIGINT:
+		return arrow.PrimitiveTypes.Int64
+	case SQL_REAL:
+		return arrow.PrimitiveTypes.Float32
+	case SQL_FLOAT, SQL_DOUBLE:
+		return arrow.PrimitiveTypes.Float64
+	case SQL_CHAR, SQL_VARCHAR, SQL_LONGVARCHAR,
+		SQL_WCHAR, SQL_WVARCHAR, SQL_WLONGVARCHAR:
+		return arrow.BinaryTypes.String
+	case SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY:
+		return arrow.BinaryTypes.Binary
+	case SQL_NUMERIC, SQL_DECIMAL:
+		return arrow.BinaryTypes.String // pass as string, let DB convert
+	case SQL_TYPE_DATE:
+		return arrow.FixedWidthTypes.Date32
+	case SQL_TYPE_TIME:
+		return arrow.FixedWidthTypes.Time64us
+	case SQL_TYPE_TIMESTAMP:
+		return &arrow.TimestampType{Unit: arrow.Microsecond}
+	default:
+		return arrow.BinaryTypes.String
+	}
+}

@@ -397,7 +397,7 @@ func SQLFreeStmt(stmtHandle C.SQLHSTMT, option C.SQLUSMALLINT) C.SQLRETURN {
 	case C.SQL_UNBIND:
 		// No-op for now (no column bindings yet)
 	case C.SQL_RESET_PARAMS:
-		// No-op for now (no parameter bindings yet)
+		stmt.resetParams()
 	}
 	return C.SQL_SUCCESS
 }
@@ -551,7 +551,8 @@ func SQLPrepare(stmtHandle C.SQLHSTMT, stmtText *C.SQLCHAR, textLength C.SQLINTE
 		return C.SQL_ERROR
 	}
 
-	if err := stmt.stmt.SetSqlQuery(query); err != nil {
+	converted := convertPlaceholders(query)
+	if err := stmt.stmt.SetSqlQuery(converted); err != nil {
 		stmt.diags.addErrorf("SQLPrepare: %v", err)
 		return C.SQL_ERROR
 	}
@@ -581,6 +582,12 @@ func SQLExecute(stmtHandle C.SQLHSTMT) C.SQLRETURN {
 
 	stmt.closeResult()
 	stmt.diags.clear()
+
+	// Bind parameters if any are set
+	if err := stmt.bindParamsToStatement(); err != nil {
+		stmt.diags.addErrorf("SQLExecute: bind params: %v", err)
+		return C.SQL_ERROR
+	}
 
 	reader, nRows, err := stmt.stmt.ExecuteQuery(context.Background())
 	if err != nil {
@@ -852,6 +859,102 @@ func SQLTables(
 	if err := stmt.tables(conn, catalog, schema, table, tableTypeStr); err != nil {
 		stmt.diags.addErrorf("SQLTables: %v", err)
 		return C.SQL_ERROR
+	}
+	return C.SQL_SUCCESS
+}
+
+//export SQLBindParameter
+func SQLBindParameter(
+	stmtHandle C.SQLHSTMT,
+	paramNum C.SQLUSMALLINT,
+	ioType C.SQLSMALLINT,
+	cType C.SQLSMALLINT,
+	sqlType C.SQLSMALLINT,
+	colSize C.SQLULEN,
+	decDigits C.SQLSMALLINT,
+	valuePtr C.SQLPOINTER,
+	bufLen C.SQLLEN,
+	lenIndPtr *C.SQLLEN,
+) C.SQLRETURN {
+	stmt := registry.getStmt(uintptr(stmtHandle))
+	if stmt == nil {
+		return C.SQL_INVALID_HANDLE
+	}
+
+	stmt.bindParam(
+		int(paramNum),
+		int16(cType),
+		int16(sqlType),
+		unsafe.Pointer(valuePtr),
+		int(bufLen),
+		unsafe.Pointer(lenIndPtr),
+	)
+	return C.SQL_SUCCESS
+}
+
+//export SQLNumParams
+func SQLNumParams(stmtHandle C.SQLHSTMT, paramCount *C.SQLSMALLINT) C.SQLRETURN {
+	stmt := registry.getStmt(uintptr(stmtHandle))
+	if stmt == nil {
+		return C.SQL_INVALID_HANDLE
+	}
+
+	if paramCount != nil {
+		*paramCount = C.SQLSMALLINT(stmt.numParams())
+	}
+	return C.SQL_SUCCESS
+}
+
+//export SQLDescribeParam
+func SQLDescribeParam(
+	stmtHandle C.SQLHSTMT,
+	paramNum C.SQLUSMALLINT,
+	dataTypePtr *C.SQLSMALLINT,
+	paramSizePtr *C.SQLULEN,
+	decimalDigitsPtr *C.SQLSMALLINT,
+	nullablePtr *C.SQLSMALLINT,
+) C.SQLRETURN {
+	stmt := registry.getStmt(uintptr(stmtHandle))
+	if stmt == nil {
+		return C.SQL_INVALID_HANDLE
+	}
+
+	// Try to get parameter schema from ADBC
+	if stmt.stmt != nil {
+		schema, err := stmt.stmt.GetParameterSchema()
+		if err == nil && schema != nil {
+			idx := int(paramNum) - 1
+			if idx >= 0 && idx < len(schema.Fields()) {
+				f := schema.Fields()[idx]
+				if dataTypePtr != nil {
+					*dataTypePtr = C.SQLSMALLINT(arrowTypeToSQLType(f.Type))
+				}
+				if paramSizePtr != nil {
+					*paramSizePtr = C.SQLULEN(arrowTypeColumnSize(f.Type))
+				}
+				if decimalDigitsPtr != nil {
+					*decimalDigitsPtr = C.SQLSMALLINT(arrowTypeDecimalDigits(f.Type))
+				}
+				if nullablePtr != nil {
+					*nullablePtr = C.SQLSMALLINT(SQL_NULLABLE)
+				}
+				return C.SQL_SUCCESS
+			}
+		}
+	}
+
+	// Fallback: report as VARCHAR
+	if dataTypePtr != nil {
+		*dataTypePtr = C.SQLSMALLINT(SQL_VARCHAR)
+	}
+	if paramSizePtr != nil {
+		*paramSizePtr = 65535
+	}
+	if decimalDigitsPtr != nil {
+		*decimalDigitsPtr = 0
+	}
+	if nullablePtr != nil {
+		*nullablePtr = C.SQLSMALLINT(SQL_NULLABLE)
 	}
 	return C.SQL_SUCCESS
 }

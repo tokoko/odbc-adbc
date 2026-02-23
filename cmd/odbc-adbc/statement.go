@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf16"
 	"unsafe"
@@ -10,7 +11,16 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
+
+type BoundParam struct {
+	cType     int16
+	sqlType   int16
+	valuePtr  unsafe.Pointer
+	bufLen    int
+	lenIndPtr unsafe.Pointer // *SQLLEN — read at execute time
+}
 
 type Statement struct {
 	connID       uintptr
@@ -20,6 +30,7 @@ type Statement struct {
 	result       *ResultSet
 	rowsAffected int64
 	diags        DiagnosticRecords
+	params       map[int]*BoundParam // 1-based param number → binding
 }
 
 type ResultSet struct {
@@ -32,6 +43,32 @@ type ResultSet struct {
 	// Raw data mode (for catalog functions — avoids Arrow memory GC issues across CGO calls)
 	rawRows     [][]any
 	rawRowCount int64
+}
+
+// convertPlaceholders replaces ODBC ? parameter markers with $1, $2, ... markers
+// that are supported by both DuckDB and PostgreSQL ADBC drivers.
+// Respects single-quoted string literals.
+func convertPlaceholders(sql string) string {
+	var result strings.Builder
+	result.Grow(len(sql) + 16)
+	paramNum := 0
+	inQuote := false
+	for i := 0; i < len(sql); i++ {
+		ch := sql[i]
+		if ch == '\'' {
+			inQuote = !inQuote
+			result.WriteByte(ch)
+		} else if ch == '?' && !inQuote {
+			paramNum++
+			fmt.Fprintf(&result, "$%d", paramNum)
+		} else {
+			result.WriteByte(ch)
+		}
+	}
+	if paramNum == 0 {
+		return sql // no placeholders, return original
+	}
+	return result.String()
 }
 
 func (s *Statement) ensureStatement(conn *Connection) error {
@@ -57,7 +94,7 @@ func (s *Statement) execDirect(conn *Connection, query string) error {
 		return err
 	}
 
-	if err := s.stmt.SetSqlQuery(query); err != nil {
+	if err := s.stmt.SetSqlQuery(convertPlaceholders(query)); err != nil {
 		return err
 	}
 
@@ -538,6 +575,316 @@ func writeWCharFromString(str string, buf unsafe.Pointer, bufLen int) int {
 	return dataLen
 }
 
+func (s *Statement) bindParam(paramNum int, cType, sqlType int16, valuePtr unsafe.Pointer, bufLen int, lenIndPtr unsafe.Pointer) {
+	if s.params == nil {
+		s.params = make(map[int]*BoundParam)
+	}
+	s.params[paramNum] = &BoundParam{
+		cType:     cType,
+		sqlType:   sqlType,
+		valuePtr:  valuePtr,
+		bufLen:    bufLen,
+		lenIndPtr: lenIndPtr,
+	}
+}
+
+func (s *Statement) resetParams() {
+	s.params = nil
+}
+
+// numParams returns the number of parameters in the prepared statement.
+func (s *Statement) numParams() int {
+	if s.stmt != nil {
+		schema, err := s.stmt.GetParameterSchema()
+		if err == nil && schema != nil {
+			return len(schema.Fields())
+		}
+	}
+	// Fallback: count '?' in query (simple, doesn't handle quoted strings)
+	return strings.Count(s.query, "?")
+}
+
+// bindParamsToStatement reads bound C parameter values and calls ADBC Bind.
+func (s *Statement) bindParamsToStatement() error {
+	if len(s.params) == 0 {
+		return nil
+	}
+
+	nParams := len(s.params)
+
+	// Build Arrow schema for parameters.
+	// Try GetParameterSchema first, but fall back to bound SQL types
+	// if unavailable or if it returns Null types (common with DuckDB).
+	var schema *arrow.Schema
+	if s.stmt != nil {
+		schema, _ = s.stmt.GetParameterSchema()
+	}
+
+	// Build/fix schema using bound parameter SQL types
+	fields := make([]arrow.Field, nParams)
+	for i := 0; i < nParams; i++ {
+		// Start from driver schema if available
+		if schema != nil && i < len(schema.Fields()) && schema.Fields()[i].Type.ID() != arrow.NULL {
+			fields[i] = schema.Fields()[i]
+		} else {
+			// Infer from bound param SQL type
+			p := s.params[i+1]
+			if p == nil {
+				fields[i] = arrow.Field{Name: fmt.Sprintf("%d", i), Type: arrow.BinaryTypes.String, Nullable: true}
+			} else {
+				fields[i] = arrow.Field{Name: fmt.Sprintf("%d", i), Type: sqlTypeToArrowType(p.sqlType), Nullable: true}
+			}
+		}
+	}
+	schema = arrow.NewSchema(fields, nil)
+
+	// Build 1-row record from bound parameters
+	bldr := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer bldr.Release()
+
+	for i := 0; i < nParams; i++ {
+		p := s.params[i+1]
+		if p == nil {
+			bldr.Field(i).AppendNull()
+			continue
+		}
+
+		val, isNull := readCParamValue(p)
+		if isNull {
+			bldr.Field(i).AppendNull()
+			continue
+		}
+
+		if err := appendValueToBuilder(bldr.Field(i), val); err != nil {
+			return fmt.Errorf("param %d: %w", i+1, err)
+		}
+	}
+
+	rec := bldr.NewRecord()
+	defer rec.Release()
+
+	return s.stmt.Bind(context.Background(), rec)
+}
+
+// readCParamValue reads the C value buffer for a bound parameter.
+// Returns (value, isNull).
+func readCParamValue(p *BoundParam) (any, bool) {
+	// Check null indicator
+	if p.lenIndPtr != nil {
+		lenInd := *(*int64)(p.lenIndPtr)
+		if lenInd == -1 { // SQL_NULL_DATA
+			return nil, true
+		}
+	}
+
+	if p.valuePtr == nil {
+		return nil, true
+	}
+
+	switch p.cType {
+	case SQL_C_SBIGINT:
+		return *(*int64)(p.valuePtr), false
+	case SQL_C_UBIGINT:
+		return int64(*(*uint64)(p.valuePtr)), false
+	case SQL_C_LONG, SQL_C_SLONG:
+		return int64(*(*int32)(p.valuePtr)), false
+	case SQL_C_ULONG:
+		return int64(*(*uint32)(p.valuePtr)), false
+	case SQL_C_SHORT, SQL_C_SSHORT:
+		return int64(*(*int16)(p.valuePtr)), false
+	case SQL_C_USHORT:
+		return int64(*(*uint16)(p.valuePtr)), false
+	case SQL_C_STINYINT:
+		return int64(*(*int8)(p.valuePtr)), false
+	case SQL_C_UTINYINT:
+		return int64(*(*uint8)(p.valuePtr)), false
+	case SQL_C_DOUBLE:
+		return *(*float64)(p.valuePtr), false
+	case SQL_C_FLOAT:
+		return float64(*(*float32)(p.valuePtr)), false
+	case SQL_C_BIT:
+		if *(*byte)(p.valuePtr) != 0 {
+			return true, false
+		}
+		return false, false
+	case SQL_C_CHAR, SQL_C_DEFAULT:
+		// Read string with length from lenIndPtr
+		strLen := p.bufLen
+		if p.lenIndPtr != nil {
+			n := *(*int64)(p.lenIndPtr)
+			if n >= 0 {
+				strLen = int(n)
+			}
+		}
+		if strLen > p.bufLen && p.bufLen > 0 {
+			strLen = p.bufLen
+		}
+		bytes := unsafe.Slice((*byte)(p.valuePtr), strLen)
+		return string(bytes), false
+	case SQL_C_WCHAR:
+		// Read UTF-16LE string
+		byteLen := p.bufLen
+		if p.lenIndPtr != nil {
+			n := *(*int64)(p.lenIndPtr)
+			if n >= 0 {
+				byteLen = int(n)
+			}
+		}
+		if byteLen > p.bufLen && p.bufLen > 0 {
+			byteLen = p.bufLen
+		}
+		nUnits := byteLen / 2
+		if nUnits == 0 {
+			return "", false
+		}
+		u16 := unsafe.Slice((*uint16)(p.valuePtr), nUnits)
+		runes := utf16.Decode(u16)
+		return string(runes), false
+	case SQL_C_BINARY:
+		dataLen := p.bufLen
+		if p.lenIndPtr != nil {
+			n := *(*int64)(p.lenIndPtr)
+			if n >= 0 {
+				dataLen = int(n)
+			}
+		}
+		bytes := make([]byte, dataLen)
+		copy(bytes, unsafe.Slice((*byte)(p.valuePtr), dataLen))
+		return bytes, false
+	default:
+		// Treat as string
+		strLen := p.bufLen
+		if p.lenIndPtr != nil {
+			n := *(*int64)(p.lenIndPtr)
+			if n >= 0 {
+				strLen = int(n)
+			}
+		}
+		bytes := unsafe.Slice((*byte)(p.valuePtr), strLen)
+		return string(bytes), false
+	}
+}
+
+// appendValueToBuilder appends a Go value to an Arrow array builder,
+// converting types as needed.
+func appendValueToBuilder(b array.Builder, val any) error {
+	switch bldr := b.(type) {
+	case *array.Int8Builder:
+		bldr.Append(int8(toInt64(val)))
+	case *array.Int16Builder:
+		bldr.Append(int16(toInt64(val)))
+	case *array.Int32Builder:
+		bldr.Append(int32(toInt64(val)))
+	case *array.Int64Builder:
+		bldr.Append(toInt64(val))
+	case *array.Uint8Builder:
+		bldr.Append(uint8(toInt64(val)))
+	case *array.Uint16Builder:
+		bldr.Append(uint16(toInt64(val)))
+	case *array.Uint32Builder:
+		bldr.Append(uint32(toInt64(val)))
+	case *array.Uint64Builder:
+		bldr.Append(uint64(toInt64(val)))
+	case *array.Float32Builder:
+		bldr.Append(float32(toFloat64(val)))
+	case *array.Float64Builder:
+		bldr.Append(toFloat64(val))
+	case *array.StringBuilder:
+		bldr.Append(toString(val))
+	case *array.BinaryBuilder:
+		switch v := val.(type) {
+		case []byte:
+			bldr.Append(v)
+		case string:
+			bldr.Append([]byte(v))
+		default:
+			bldr.Append([]byte(fmt.Sprint(val)))
+		}
+	case *array.BooleanBuilder:
+		switch v := val.(type) {
+		case bool:
+			bldr.Append(v)
+		default:
+			bldr.Append(toInt64(val) != 0)
+		}
+	case *array.Date32Builder:
+		bldr.Append(arrow.Date32FromTime(toTime(val)))
+	case *array.TimestampBuilder:
+		t := toTime(val)
+		bldr.Append(arrow.Timestamp(t.UnixMicro()))
+	default:
+		// Generic fallback: try string
+		if sb, ok := b.(*array.StringBuilder); ok {
+			sb.Append(toString(val))
+		} else {
+			return fmt.Errorf("unsupported builder type %T", b)
+		}
+	}
+	return nil
+}
+
+func toInt64(val any) int64 {
+	switch v := val.(type) {
+	case int64:
+		return v
+	case int32:
+		return int64(v)
+	case int16:
+		return int64(v)
+	case int8:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case float32:
+		return int64(v)
+	case bool:
+		if v {
+			return 1
+		}
+		return 0
+	default:
+		return 0
+	}
+}
+
+func toFloat64(val any) float64 {
+	switch v := val.(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case int32:
+		return float64(v)
+	case int16:
+		return float64(v)
+	default:
+		return 0
+	}
+}
+
+func toString(val any) string {
+	switch v := val.(type) {
+	case string:
+		return v
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func toTime(val any) time.Time {
+	switch v := val.(type) {
+	case time.Time:
+		return v
+	case string:
+		t, _ := time.Parse("2006-01-02 15:04:05", v)
+		return t
+	default:
+		return time.Time{}
+	}
+}
+
 // writeRawValue writes a Go value (from raw rows) to a C buffer.
 func writeRawValue(val any, targetType int16, buf unsafe.Pointer, bufLen int) (int, error) {
 	switch v := val.(type) {
@@ -606,6 +953,7 @@ func (s *Statement) closeResult() {
 
 func (s *Statement) close() error {
 	s.closeResult()
+	s.resetParams()
 	if s.stmt != nil {
 		err := s.stmt.Close()
 		s.stmt = nil
